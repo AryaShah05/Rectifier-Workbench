@@ -1,0 +1,33 @@
+body {
+  font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+}
+.font-mono {
+  font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
+  font-variant-numeric: tabular-nums;
+}
+@keyframes flowDash {
+  to { stroke-dashoffset: -24; }
+}
+.animate-current-flow {
+  animation: flowDash 0.55s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) { .animate-current-flow { animation: none; } }
+html { color-scheme: light; }
+html.dark { color-scheme: dark; }
+html.dark body { background: #0B0F19 !important; color: #E2E8F0; }
+.dark .bg-white { background-color: #111827 !important; }
+.dark .bg-slate-50, .dark .bg-slate-50\/70 { background-color: #0F172A !important; }
+.dark .bg-slate-100, .dark .bg-slate-200, .dark .bg-slate-200\/70 { background-color: #1E293B !important; }
+.dark .bg-slate-900 { background-color: #2563EB !important; }
+.dark .border-slate-200, .dark .border-slate-300 { border-color: #1E293B !important; }
+.dark .divide-slate-200 > * { border-color: #1E293B !important; }
+.dark .text-slate-900 { color: #F1F5F9 !important; }
+.dark .text-slate-600 { color: #CBD5E1 !important; }
+.dark .text-slate-500 { color: #94A3B8 !important; }
+.dark .text-blue-600 { color: #60A5FA !important; }
+.dark .text-emerald-600 { color: #34D399 !important; }
+.dark .text-amber-600 { color: #FBBF24 !important; }
+.dark .text-purple-600 { color: #C084FC !important; }
+.dark .text-rose-600 { color: #FB7185 !important; }
+.dark .text-slate-950 { color: #0B0F19 !important; }
