@@ -1,0 +1,1239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Interactive AC-DC Rectifier Simulator — Arya Shah (24EE10038)</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+body {
+  font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+}
+.font-mono {
+  font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
+  font-variant-numeric: tabular-nums;
+}
+@keyframes flowDash {
+  to { stroke-dashoffset: -24; }
+}
+.animate-current-flow {
+  animation: flowDash 0.55s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) { .animate-current-flow { animation: none; } }
+html { color-scheme: light; }
+html.dark { color-scheme: dark; }
+html.dark body { background: #0B0F19 !important; color: #E2E8F0; }
+.dark .bg-white { background-color: #111827 !important; }
+.dark .bg-slate-50, .dark .bg-slate-50\/70 { background-color: #0F172A !important; }
+.dark .bg-slate-100, .dark .bg-slate-200, .dark .bg-slate-200\/70 { background-color: #1E293B !important; }
+.dark .bg-slate-900 { background-color: #2563EB !important; }
+.dark .border-slate-200, .dark .border-slate-300 { border-color: #1E293B !important; }
+.dark .divide-slate-200 > * { border-color: #1E293B !important; }
+.dark .text-slate-900 { color: #F1F5F9 !important; }
+.dark .text-slate-600 { color: #CBD5E1 !important; }
+.dark .text-slate-500 { color: #94A3B8 !important; }
+.dark .text-blue-600 { color: #60A5FA !important; }
+.dark .text-emerald-600 { color: #34D399 !important; }
+.dark .text-amber-600 { color: #FBBF24 !important; }
+.dark .text-purple-600 { color: #C084FC !important; }
+.dark .text-rose-600 { color: #FB7185 !important; }
+.dark .text-slate-950 { color: #0B0F19 !important; }
+</style>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"></script>
+</head>
+<body class="bg-[#F8FAFC] text-slate-900 antialiased selection:bg-blue-500/20">
+  <div id="root"></div>
+  <script>
+const { useState, useEffect, useMemo, useRef } = React;
+function getSwitchLabel(slotId, switches) {
+  const num = slotId.replace(/^[SDT]/, '');
+  const type = switches[slotId] || 'D';
+  return `${type}${num}`;
+}
+
+function hasAnyThyristor(params) {
+  const { phase, wave, switches } = params;
+  if (phase === '1P' && wave === 'HALF') return switches['S1'] === 'T';
+  if (phase === '1P' && wave === 'FULL') return ['S1', 'S2', 'S3', 'S4'].some((k) => switches[k] === 'T');
+  if (phase === '3P' && wave === 'HALF') return ['S1', 'S2', 'S3'].some((k) => switches[k] === 'T');
+  return ['S1', 'S2', 'S3', 'S4', 'S5', 'S6'].some((k) => switches[k] === 'T');
+}
+
+function runRectifierSimulation(params) {
+  const {
+    phase, wave, switches, alphaDeg, freewheelingDiode: fwdUser,
+    loadType, R: rawR, L_mH: rawL, E: rawE, I_dc_const, Ls_mH, V_rms, freq
+  } = params;
+
+  const omega = 2 * Math.PI * freq;
+  // A constant-current load on a half-wave rectifier has no valid path without D_FW, so it is forced on.
+  const freewheelingDiode = fwdUser || (phase === '1P' && wave === 'HALF' && loadType === 'CURRENT_SOURCE');
+  const V_m = V_rms * Math.sqrt(2);
+  const V_m_LL = V_m * Math.sqrt(3);
+
+  const R = Math.max(0.5, rawR);
+  const L = loadType === 'R' ? 0 : Math.max(0, rawL) * 1e-3;
+  const E = loadType === 'RLE' ? rawE : 0;
+  const Ls = Math.max(0, Ls_mH) * 1e-3;
+
+  const getAlphaRad = (slotKey) => (switches[slotKey] === 'T' ? (alphaDeg * Math.PI) / 180 : 0);
+
+  const tau = L / R;
+  const cyclePeriod = 1 / freq;
+  const numWarmupCycles =
+    L > 0 && loadType !== 'CURRENT_SOURCE'
+      ? Math.min(16, Math.max(4, Math.ceil((5 * tau) / cyclePeriod) + 2))
+      : 2;
+  const totalCycles = numWarmupCycles + 2;
+
+  const subStepsPerDeg = 8;
+  const degStep = 1 / subStepsPerDeg;
+  const dTheta = (degStep * Math.PI) / 180;
+  const dt = dTheta / omega;
+
+  const totalSteps = totalCycles * 360 * subStepsPerDeg;
+  const recordStartStep = numWarmupCycles * 360 * subStepsPerDeg;
+
+  const points = [];
+  let i_o = loadType === 'CURRENT_SOURCE' ? I_dc_const : 0;
+  let activeUpper = 'NONE';
+  let activeLower = 'NONE';
+  let isFreewheeling = false;
+  let muRad = 0;
+
+  for (let step = 0; step <= totalSteps; step++) {
+    const totalDeg = step * degStep;
+    const degInCycle = totalDeg % 360;
+    const rad = (totalDeg * Math.PI) / 180;
+    const wt = ((degInCycle * Math.PI) / 180) % (2 * Math.PI);
+
+    const v_sa = V_m * Math.sin(rad);
+    const v_sb = V_m * Math.sin(rad - (2 * Math.PI) / 3);
+    const v_sc = V_m * Math.sin(rad + (2 * Math.PI) / 3);
+
+    const v_ab = v_sa - v_sb, v_bc = v_sb - v_sc, v_ca = v_sc - v_sa;
+    const v_ba = -v_ab, v_cb = -v_bc, v_ac = -v_ca;
+
+    let v_o = 0, i_sa = 0, i_sb = 0, i_sc = 0, i_fw = 0;
+    const switchCurrents = {};
+    const activeSwitches = [];
+    let activeLoopLabel = 'Blocked / Zero Current';
+    let gateTriggerPulse = false;
+
+    const l1 = getSwitchLabel('S1', switches);
+    const l2 = getSwitchLabel('S2', switches);
+    const l3 = getSwitchLabel('S3', switches);
+    const l4 = getSwitchLabel('S4', switches);
+    const l5 = getSwitchLabel('S5', switches);
+    const l6 = getSwitchLabel('S6', switches);
+
+    // 1. SINGLE-PHASE HALF-WAVE
+    if (phase === '1P' && wave === 'HALF') {
+      const alpha1 = getAlphaRad('S1');
+      const alpha1Deg = (alpha1 * 180) / Math.PI;
+      if (switches['S1'] === 'T' && Math.abs(degInCycle - alpha1Deg) <= 1.5) gateTriggerPulse = true;
+
+      const gateReady = wt >= alpha1 && wt <= Math.PI;
+      if (gateReady && v_sa > (isFreewheeling ? 0 : E)) {
+        activeUpper = 'S1';
+        isFreewheeling = false;
+      }
+
+      if (loadType === 'CURRENT_SOURCE') {
+        i_o = I_dc_const;
+        if (freewheelingDiode) {
+          const cosEnd = Math.cos(alpha1) - (omega * Ls * I_dc_const) / V_m;
+          const endAngle = cosEnd >= -1 ? Math.acos(Math.min(1, cosEnd)) : Math.PI;
+          muRad = Math.max(0, endAngle - alpha1);
+          if (wt >= alpha1 && wt < endAngle && Ls > 0) {
+            const i_s1 = (V_m / (omega * Ls)) * (Math.cos(alpha1) - Math.cos(wt));
+            const clamped_s1 = Math.max(0, Math.min(I_dc_const, i_s1));
+            v_o = 0; i_sa = clamped_s1; i_fw = I_dc_const - clamped_s1;
+            switchCurrents[l1] = i_sa; switchCurrents['D_FW'] = i_fw;
+            activeSwitches.push(l1, 'D_FW');
+            activeLoopLabel = `Commutation Overlap: ${l1} + D_FW`;
+          } else if (wt >= endAngle && wt <= Math.PI) {
+            v_o = v_sa; i_sa = I_dc_const; switchCurrents[l1] = i_o;
+            activeSwitches.push(l1);
+            activeLoopLabel = `Active Loop: Source → ${l1} → Load`;
+          } else {
+            v_o = 0; i_fw = I_dc_const; switchCurrents['D_FW'] = i_fw;
+            activeSwitches.push('D_FW');
+            activeLoopLabel = 'Freewheeling Loop: D_FW → Load';
+          }
+        } else {
+          v_o = v_sa; i_sa = I_dc_const; switchCurrents[l1] = i_o;
+          activeSwitches.push(l1);
+          activeLoopLabel = `Active Loop: Source → ${l1} → Load`;
+        }
+      } else {
+        if (activeUpper === 'S1' && freewheelingDiode && v_sa <= 0 && i_o > 0) {
+          activeUpper = 'NONE';
+          isFreewheeling = true;
+        }
+        if (activeUpper === 'S1') {
+          v_o = v_sa;
+          if (L === 0) {
+            i_o = Math.max(0, (v_o - E) / R);
+            if (i_o <= 0) activeUpper = 'NONE';
+          } else {
+            i_o += ((v_o - E - R * i_o) / L) * dt;
+            if (i_o <= 1e-5 && (wt > Math.PI || v_o <= E)) { i_o = 0; activeUpper = 'NONE'; }
+          }
+          if (i_o > 0) {
+            i_sa = i_o; switchCurrents[l1] = i_o; activeSwitches.push(l1);
+            activeLoopLabel = `Active Loop: Source → ${l1} → Load`;
+          }
+        } else if (isFreewheeling && freewheelingDiode) {
+          v_o = 0;
+          if (L === 0) { i_o = 0; isFreewheeling = false; }
+          else {
+            i_o += ((0 - E - R * i_o) / L) * dt;
+            if (i_o <= 1e-5) { i_o = 0; isFreewheeling = false; }
+          }
+          if (i_o > 0) {
+            i_fw = i_o; switchCurrents['D_FW'] = i_o; activeSwitches.push('D_FW');
+            activeLoopLabel = 'Freewheeling Loop: D_FW → Load';
+          }
+        } else {
+          i_o = 0; v_o = E;
+          activeLoopLabel = E > 0 ? 'Blocked (v_o = E)' : 'Blocked / Zero Current';
+        }
+      }
+    }
+
+    // 2. SINGLE-PHASE FULL-BRIDGE
+    else if (phase === '1P' && wave === 'FULL') {
+      const a1 = getAlphaRad('S1'), a2 = getAlphaRad('S2'), a3 = getAlphaRad('S3'), a4 = getAlphaRad('S4');
+      const alphaPos = Math.max(a1, a2);
+      const alphaNeg = Math.PI + Math.max(a3, a4);
+      if ((switches['S1'] === 'T' || switches['S2'] === 'T') && Math.abs(degInCycle - (alphaPos * 180) / Math.PI) <= 1.5) gateTriggerPulse = true;
+      if ((switches['S3'] === 'T' || switches['S4'] === 'T') && Math.abs(degInCycle - (alphaNeg * 180) / Math.PI) <= 1.5) gateTriggerPulse = true;
+
+      const canLegFWFromPos = switches['S4'] === 'D' || switches['S3'] === 'D';
+      const canLegFWFromNeg = switches['S2'] === 'D' || switches['S1'] === 'D';
+      const hasNaturalLegFW = canLegFWFromPos || canLegFWFromNeg || freewheelingDiode;
+
+      if (loadType === 'CURRENT_SOURCE') {
+        i_o = I_dc_const;
+        const cosMuEnd = Math.cos(alphaPos) - (2 * omega * Ls * I_dc_const) / V_m;
+        const posEndAngle = cosMuEnd >= -1 ? Math.acos(Math.min(1, cosMuEnd)) : Math.PI;
+        muRad = Math.max(0, posEndAngle - alphaPos);
+        const relWt = (wt - alphaPos + 2 * Math.PI) % (2 * Math.PI);
+        if (Ls > 0 && relWt < muRad) {
+          v_o = 0;
+          const frac = Math.max(0, Math.min(1, (Math.cos(alphaPos) - Math.cos(wt)) / (Math.cos(alphaPos) - Math.cos(posEndAngle) + 1e-9)));
+          const i_pos = I_dc_const * frac, i_neg = I_dc_const * (1 - frac);
+          i_sa = i_pos - i_neg;
+          switchCurrents[l1] = i_pos; switchCurrents[l2] = i_pos; switchCurrents[l3] = i_neg; switchCurrents[l4] = i_neg;
+          activeSwitches.push(l1, l2, l3, l4);
+          activeLoopLabel = `Commutation Overlap: ${l1},${l2},${l3},${l4} (v_o = 0V)`;
+        } else if (Ls > 0 && relWt >= Math.PI && relWt < Math.PI + muRad) {
+          v_o = 0;
+          const wtNeg = wt - Math.PI;
+          const frac = Math.max(0, Math.min(1, (Math.cos(alphaPos) - Math.cos(wtNeg)) / (Math.cos(alphaPos) - Math.cos(posEndAngle) + 1e-9)));
+          const i_neg = I_dc_const * frac, i_pos = I_dc_const * (1 - frac);
+          i_sa = i_pos - i_neg;
+          switchCurrents[l1] = i_pos; switchCurrents[l2] = i_pos; switchCurrents[l3] = i_neg; switchCurrents[l4] = i_neg;
+          activeSwitches.push(l1, l2, l3, l4);
+          activeLoopLabel = `Commutation Overlap: ${l1},${l2},${l3},${l4} (v_o = 0V)`;
+        } else if (relWt < Math.PI) {
+          if (hasNaturalLegFW && v_sa < 0) {
+            v_o = 0; i_sa = 0;
+            if (freewheelingDiode) { i_fw = I_dc_const; switchCurrents['D_FW'] = I_dc_const; activeSwitches.push('D_FW'); activeLoopLabel = 'Freewheeling Diode D_FW'; }
+            else { switchCurrents[l1] = I_dc_const; switchCurrents[l4] = I_dc_const; activeSwitches.push(l1, l4); activeLoopLabel = `Leg Freewheeling: ${l1} + ${l4}`; }
+          } else {
+            v_o = v_sa; i_sa = I_dc_const; switchCurrents[l1] = I_dc_const; switchCurrents[l2] = I_dc_const; activeSwitches.push(l1, l2);
+            activeLoopLabel = `Positive Diagonal: ${l1} + ${l2}`;
+          }
+        } else {
+          if (hasNaturalLegFW && -v_sa < 0) {
+            v_o = 0; i_sa = 0;
+            if (freewheelingDiode) { i_fw = I_dc_const; switchCurrents['D_FW'] = I_dc_const; activeSwitches.push('D_FW'); activeLoopLabel = 'Freewheeling Diode D_FW'; }
+            else { switchCurrents[l3] = I_dc_const; switchCurrents[l2] = I_dc_const; activeSwitches.push(l3, l2); activeLoopLabel = `Leg Freewheeling: ${l3} + ${l2}`; }
+          } else {
+            v_o = -v_sa; i_sa = -I_dc_const; switchCurrents[l3] = I_dc_const; switchCurrents[l4] = I_dc_const; activeSwitches.push(l3, l4);
+            activeLoopLabel = `Negative Diagonal: ${l3} + ${l4}`;
+          }
+        }
+      } else {
+        const canFirePos = wt >= alphaPos && wt < Math.PI && v_sa > (i_o > 0 ? -1e9 : E);
+        const canFireNeg = wt >= alphaNeg && wt < 2 * Math.PI && -v_sa > (i_o > 0 ? -1e9 : E);
+        if (canFirePos) activeUpper = 'POS_PAIR';
+        else if (canFireNeg) activeUpper = 'NEG_PAIR';
+
+        if (i_o > 0) {
+          if (activeUpper === 'POS_PAIR' && v_sa <= 0 && (canLegFWFromPos || freewheelingDiode)) {
+            activeUpper = freewheelingDiode ? 'FW_DIODE' : switches['S4'] === 'D' ? 'LEG_FW_A' : 'LEG_FW_B';
+          } else if (activeUpper === 'NEG_PAIR' && -v_sa <= 0 && (canLegFWFromNeg || freewheelingDiode)) {
+            activeUpper = freewheelingDiode ? 'FW_DIODE' : switches['S2'] === 'D' ? 'LEG_FW_B' : 'LEG_FW_A';
+          }
+        }
+
+        if (activeUpper === 'POS_PAIR') v_o = v_sa;
+        else if (activeUpper === 'NEG_PAIR') v_o = -v_sa;
+        else if (activeUpper === 'FW_DIODE' || activeUpper === 'LEG_FW_A' || activeUpper === 'LEG_FW_B') v_o = 0;
+        else v_o = E;
+
+        if (activeUpper !== 'NONE') {
+          if (L === 0) { i_o = Math.max(0, (v_o - E) / R); if (i_o <= 0) activeUpper = 'NONE'; }
+          else {
+            const effL = activeUpper === 'POS_PAIR' || activeUpper === 'NEG_PAIR' ? L : L;
+            i_o += ((v_o - E - R * i_o) / effL) * dt;
+            if (i_o <= 1e-5) { i_o = 0; activeUpper = 'NONE'; v_o = E; }
+          }
+        } else { i_o = 0; v_o = E; }
+
+        if (i_o > 0) {
+          if (activeUpper === 'POS_PAIR') { i_sa = i_o; switchCurrents[l1] = i_o; switchCurrents[l2] = i_o; activeSwitches.push(l1, l2); activeLoopLabel = `Positive Diagonal: ${l1} + ${l2}`; }
+          else if (activeUpper === 'NEG_PAIR') { i_sa = -i_o; switchCurrents[l3] = i_o; switchCurrents[l4] = i_o; activeSwitches.push(l3, l4); activeLoopLabel = `Negative Diagonal: ${l3} + ${l4}`; }
+          else if (activeUpper === 'FW_DIODE') { i_sa = 0; i_fw = i_o; switchCurrents['D_FW'] = i_o; activeSwitches.push('D_FW'); activeLoopLabel = 'Freewheeling Diode D_FW → Load'; }
+          else if (activeUpper === 'LEG_FW_A') { i_sa = 0; switchCurrents[l1] = i_o; switchCurrents[l4] = i_o; activeSwitches.push(l1, l4); activeLoopLabel = `Zero-Voltage Leg Loop: ${l1} + ${l4}`; }
+          else if (activeUpper === 'LEG_FW_B') { i_sa = 0; switchCurrents[l3] = i_o; switchCurrents[l2] = i_o; activeSwitches.push(l3, l2); activeLoopLabel = `Zero-Voltage Leg Loop: ${l3} + ${l2}`; }
+        }
+      }
+    }
+
+    // 3. THREE-PHASE HALF-WAVE (3-PULSE)
+    else if (phase === '3P' && wave === 'HALF') {
+      const a1 = getAlphaRad('S1'), a2 = getAlphaRad('S2'), a3 = getAlphaRad('S3');
+      const fire1 = Math.PI / 6 + a1, fire2 = (5 * Math.PI) / 6 + a2, fire3 = (9 * Math.PI) / 6 + a3;
+      const fire1Deg = (fire1 * 180) / Math.PI, fire2Deg = (fire2 * 180) / Math.PI, fire3Deg = (fire3 * 180) / Math.PI;
+      if (
+        (switches['S1'] === 'T' && Math.abs(degInCycle - (fire1Deg % 360)) <= 1.5) ||
+        (switches['S2'] === 'T' && Math.abs(degInCycle - (fire2Deg % 360)) <= 1.5) ||
+        (switches['S3'] === 'T' && Math.abs(degInCycle - (fire3Deg % 360)) <= 1.5)
+      ) gateTriggerPulse = true;
+
+      const wtShift = wt < Math.PI / 6 ? wt + 2 * Math.PI : wt;
+      let candidateSwitch = wtShift >= fire3 ? 'S3' : wtShift >= fire2 ? 'S2' : wtShift >= fire1 ? 'S1' : 'S3';
+      if (switches['S1'] === 'D' && v_sa >= v_sb && v_sa >= v_sc) candidateSwitch = 'S1';
+      else if (switches['S2'] === 'D' && v_sb >= v_sa && v_sb >= v_sc) candidateSwitch = 'S2';
+      else if (switches['S3'] === 'D' && v_sc >= v_sa && v_sc >= v_sb) candidateSwitch = 'S3';
+
+      let v_cand = candidateSwitch === 'S1' ? v_sa : candidateSwitch === 'S2' ? v_sb : v_sc;
+
+      if (loadType === 'CURRENT_SOURCE') {
+        i_o = I_dc_const;
+        if (freewheelingDiode && v_cand < 0) {
+          v_o = 0; i_fw = I_dc_const; switchCurrents['D_FW'] = I_dc_const; activeSwitches.push('D_FW');
+          activeLoopLabel = 'Freewheeling Diode D_FW → Load';
+        } else {
+          v_o = v_cand;
+          const lbl = getSwitchLabel(candidateSwitch, switches);
+          switchCurrents[lbl] = I_dc_const; activeSwitches.push(lbl);
+          if (candidateSwitch === 'S1') i_sa = I_dc_const;
+          if (candidateSwitch === 'S2') i_sb = I_dc_const;
+          if (candidateSwitch === 'S3') i_sc = I_dc_const;
+          activeLoopLabel = `3-Pulse Active: ${lbl} Conducting`;
+        }
+      } else {
+        if (v_cand > (i_o > 0 ? -1e9 : E)) activeUpper = candidateSwitch;
+        if (freewheelingDiode && v_cand <= 0 && i_o > 0) activeUpper = 'FW_DIODE';
+
+        if (activeUpper === 'S1' || activeUpper === 'S2' || activeUpper === 'S3') {
+          v_o = activeUpper === 'S1' ? v_sa : activeUpper === 'S2' ? v_sb : v_sc;
+          if (L === 0) { i_o = Math.max(0, (v_o - E) / R); if (i_o <= 0) activeUpper = 'NONE'; }
+          else { i_o += ((v_o - E - R * i_o) / L) * dt; if (i_o <= 1e-5) { i_o = 0; activeUpper = 'NONE'; v_o = E; } }
+          if (i_o > 0) {
+            const lbl = getSwitchLabel(activeUpper, switches);
+            switchCurrents[lbl] = i_o; activeSwitches.push(lbl);
+            if (activeUpper === 'S1') i_sa = i_o;
+            if (activeUpper === 'S2') i_sb = i_o;
+            if (activeUpper === 'S3') i_sc = i_o;
+            activeLoopLabel = `Phase ${activeUpper === 'S1' ? 'A' : activeUpper === 'S2' ? 'B' : 'C'} → ${lbl} → Load`;
+          }
+        } else if (activeUpper === 'FW_DIODE') {
+          v_o = 0;
+          if (L === 0) { i_o = 0; activeUpper = 'NONE'; }
+          else { i_o += ((0 - E - R * i_o) / L) * dt; if (i_o <= 1e-5) { i_o = 0; activeUpper = 'NONE'; } }
+          if (i_o > 0) { i_fw = i_o; switchCurrents['D_FW'] = i_o; activeSwitches.push('D_FW'); activeLoopLabel = 'Freewheeling Diode D_FW → Load'; }
+        } else { i_o = 0; v_o = E; }
+      }
+    }
+
+    // 4. THREE-PHASE FULL-BRIDGE (6-PULSE)
+    else {
+      const a1 = getAlphaRad('S1'), a3 = getAlphaRad('S3'), a5 = getAlphaRad('S5');
+      const a2 = getAlphaRad('S2'), a4 = getAlphaRad('S4'), a6 = getAlphaRad('S6');
+
+      const firingAnglesDeg = [
+        (30 + (a1 * 180) / Math.PI) % 360, (90 + (a2 * 180) / Math.PI) % 360,
+        (150 + (a3 * 180) / Math.PI) % 360, (210 + (a4 * 180) / Math.PI) % 360,
+        (270 + (a5 * 180) / Math.PI) % 360, (330 + (a6 * 180) / Math.PI) % 360,
+      ];
+      if (hasAnyThyristor(params) && firingAnglesDeg.some((ang) => Math.abs(degInCycle - ang) <= 1.2)) {
+        gateTriggerPulse = true;
+      }
+
+      const wtUpper = wt < Math.PI / 6 ? wt + 2 * Math.PI : wt;
+      const upSw = wtUpper >= (9 * Math.PI) / 6 + a5 ? 'S5' : wtUpper >= (5 * Math.PI) / 6 + a3 ? 'S3' : wtUpper >= Math.PI / 6 + a1 ? 'S1' : 'S5';
+      const wtLower = wt < Math.PI / 2 ? wt + 2 * Math.PI : wt;
+      const lowSw = wtLower >= (11 * Math.PI) / 6 + a6 ? 'S6' : wtLower >= (7 * Math.PI) / 6 + a4 ? 'S4' : wtLower >= Math.PI / 2 + a2 ? 'S2' : 'S6';
+
+      const v_up = upSw === 'S1' ? v_sa : upSw === 'S3' ? v_sb : v_sc;
+      const v_low = lowSw === 'S4' ? v_sa : lowSw === 'S6' ? v_sb : v_sc;
+      const v_pair = v_up - v_low;
+      const upLbl = getSwitchLabel(upSw, switches), lowLbl = getSwitchLabel(lowSw, switches);
+
+      if (loadType === 'CURRENT_SOURCE') {
+        i_o = I_dc_const;
+        if (freewheelingDiode && v_pair < 0) {
+          v_o = 0; i_fw = I_dc_const; switchCurrents['D_FW'] = I_dc_const; activeSwitches.push('D_FW');
+          activeLoopLabel = 'Freewheeling Diode D_FW → Load';
+        } else {
+          v_o = v_pair;
+          switchCurrents[upLbl] = I_dc_const; switchCurrents[lowLbl] = I_dc_const; activeSwitches.push(upLbl, lowLbl);
+          if (upSw === 'S1') i_sa += I_dc_const; if (upSw === 'S3') i_sb += I_dc_const; if (upSw === 'S5') i_sc += I_dc_const;
+          if (lowSw === 'S4') i_sa -= I_dc_const; if (lowSw === 'S6') i_sb -= I_dc_const; if (lowSw === 'S2') i_sc -= I_dc_const;
+          activeLoopLabel = `6-Pulse Pair ${upLbl} + ${lowLbl}`;
+        }
+      } else {
+        if (v_pair > (i_o > 0 ? -1e9 : E)) { activeUpper = upSw; activeLower = lowSw; isFreewheeling = false; }
+        if (freewheelingDiode && v_pair <= 0 && i_o > 0) isFreewheeling = true;
+
+        if (isFreewheeling && freewheelingDiode) {
+          v_o = 0;
+          if (L === 0) { i_o = 0; isFreewheeling = false; }
+          else { i_o += ((0 - E - R * i_o) / L) * dt; if (i_o <= 1e-5) { i_o = 0; isFreewheeling = false; } }
+          if (i_o > 0) { i_fw = i_o; switchCurrents['D_FW'] = i_o; activeSwitches.push('D_FW'); activeLoopLabel = 'Freewheeling Diode D_FW → Load'; }
+        } else if (activeUpper !== 'NONE' && activeLower !== 'NONE') {
+          v_o = v_pair;
+          if (L === 0) { i_o = Math.max(0, (v_o - E) / R); if (i_o <= 0) { activeUpper = 'NONE'; activeLower = 'NONE'; v_o = E; } }
+          else { i_o += ((v_o - E - R * i_o) / (L)) * dt; if (i_o <= 1e-5) { i_o = 0; activeUpper = 'NONE'; activeLower = 'NONE'; v_o = E; } }
+          if (i_o > 0) {
+            switchCurrents[upLbl] = i_o; switchCurrents[lowLbl] = i_o; activeSwitches.push(upLbl, lowLbl);
+            if (upSw === 'S1') i_sa += i_o; if (upSw === 'S3') i_sb += i_o; if (upSw === 'S5') i_sc += i_o;
+            if (lowSw === 'S4') i_sa -= i_o; if (lowSw === 'S6') i_sb -= i_o; if (lowSw === 'S2') i_sc -= i_o;
+            activeLoopLabel = `6-Pulse Pair ${upLbl} + ${lowLbl}`;
+          }
+        } else { i_o = 0; v_o = E; }
+      }
+    }
+
+    if (step >= recordStartStep && (step - recordStartStep) % subStepsPerDeg === 0) {
+      const recDeg = (step - recordStartStep) / subStepsPerDeg;
+      points.push({
+        deg: recDeg, timeMs: (recDeg / 360) * cyclePeriod * 1000,
+        v_sa, v_sb, v_sc, v_ab, v_bc, v_ca, v_ba, v_cb, v_ac,
+        v_o, i_o, i_sa, i_sb, i_sc, i_fw, switchCurrents, activeSwitches, activeLoopLabel, gateTriggerPulse
+      });
+    }
+  }
+
+  const N = 360;
+  const cyclePts = points.slice(0, N);
+  let sum_isa = 0, sum_vo = 0, sum_vo_sq = 0, sum_io = 0, sum_io_sq = 0, sum_isa_sq = 0, sum_p = 0, zeroCurrentSteps = 0;
+  let betaDeg = null;
+
+  for (let k = 0; k < N; k++) {
+    const pt = cyclePts[k];
+    sum_vo += pt.v_o; sum_vo_sq += pt.v_o * pt.v_o;
+    sum_io += pt.i_o; sum_io_sq += pt.i_o * pt.i_o;
+    sum_isa_sq += pt.i_sa * pt.i_sa; sum_isa += pt.i_sa; sum_p += pt.v_o * pt.i_o;
+    if (pt.i_o <= 1e-3) zeroCurrentSteps++;
+    if (k > 5 && cyclePts[k - 1].i_o > 1e-3 && pt.i_o <= 1e-3 && betaDeg === null) betaDeg = pt.deg;
+  }
+
+  const V_dc = sum_vo / N, V_rms_out = Math.sqrt(sum_vo_sq / N);
+  const I_dc = sum_io / N, I_rms_out = Math.sqrt(sum_io_sq / N);
+  const I_s_rms = Math.sqrt(sum_isa_sq / N), P_load = sum_p / N;
+  const S_in = phase === '3P' ? 3 * V_rms * I_s_rms : V_rms * I_s_rms;
+  const PF_true = S_in > 1e-3 ? Math.min(1, Math.max(-1, P_load / S_in)) : 0;
+
+  let a1_i = 0, b1_i = 0;
+  for (let k = 0; k < N; k++) {
+    const theta = (k * 2 * Math.PI) / N;
+    a1_i += cyclePts[k].i_sa * Math.cos(theta);
+    b1_i += cyclePts[k].i_sa * Math.sin(theta);
+  }
+  a1_i = (2 / N) * a1_i; b1_i = (2 / N) * b1_i;
+  const I1_peak = Math.hypot(a1_i, b1_i);
+  const I1_rms = I1_peak / Math.sqrt(2);
+  const phi1_rad = Math.atan2(a1_i, b1_i);
+  const DPF = I1_peak > 1e-4 ? Math.cos(phi1_rad) : 0;
+  const THD_i = I1_rms > 1e-4 ? Math.sqrt(Math.max(0, ((I_s_rms * I_s_rms - Math.pow(sum_isa / N, 2)) / (I1_rms * I1_rms)) - 1)) * 100 : 0;
+  const FF = Math.abs(V_dc) > 1e-2 ? V_rms_out / Math.abs(V_dc) : 1;
+  const RF = FF > 1 ? Math.sqrt(FF * FF - 1) : 0;
+  // Analytic commutation overlap (standard textbook results)
+  const aEff = hasAnyThyristor(params) ? (alphaDeg * Math.PI) / 180 : 0;
+  const kMu = phase === '1P' ? (wave === 'FULL' ? 2 : 1) : 2 / Math.sqrt(3);
+  const xMu = (omega * Ls * Math.abs(I_dc) * kMu) / V_m;
+  const muAnalytic = Ls > 0 && I_dc > 1e-3 ? Math.max(0, Math.acos(Math.max(-1, Math.min(1, Math.cos(aEff) - xMu))) - aEff) : 0;
+  const muDeg = (muAnalytic * 180) / Math.PI;
+  const [nCom, aCom] = phase === '1P' ? (wave === 'FULL' ? [2, 2] : [1, 1]) : (wave === 'FULL' ? [6, 1] : [3, 1]);
+  const dVov = Ls > 0 ? (nCom * aCom * omega * Ls * I_dc) / (2 * Math.PI) : 0;
+  const overlapInWaveform = loadType === 'CURRENT_SOURCE' && phase === '1P';
+  const V_dc_ov = overlapInWaveform ? V_dc : V_dc - dVov;
+  const conductionMode = zeroCurrentSteps > 3 ? 'DCM' : 'CCM';
+
+  return {
+    points,
+    metrics: { V_m, V_m_LL, V_dc, V_rms_out, I_dc, I_rms_out, P_load, S_in, PF_true, DPF, THD_i, FF, RF, conductionMode, betaDeg, muDeg, V_dc_ov, dVov, fwdForced: freewheelingDiode && !fwdUser }
+  };
+}
+
+  </script>
+  <script type="text/babel">
+// =========================================================================
+// 2. INTERACTIVE CIRCUIT SCHEMATIC COMPONENT
+// =========================================================================
+function CircuitSchematic({ params, currentPoint, onToggleSwitch, onToggleFWD, lightMode }) {
+  const { phase, wave, switches, freewheelingDiode, loadType, R, L_mH, E, I_dc_const, Ls_mH } = params;
+  const activeSet = new Set(currentPoint.activeSwitches);
+  const hasCurrent = currentPoint.i_o > 0.01;
+
+  const wireBase = lightMode ? '#CBD5E1' : '#334155';
+  const wireActive = '#10B981';
+  const wireParticle = lightMode ? '#047857' : '#6EE7B7';
+  const bgCard = lightMode ? 'bg-white border-slate-200 text-slate-900 shadow-sm' : 'bg-[#111827] border-slate-800 text-slate-100';
+  const canvasBg = lightMode ? 'bg-[#F8FAFC]' : 'bg-[#0B0F19]';
+  const headerBorder = lightMode ? 'border-slate-200' : 'border-slate-800';
+
+  const renderSwitch = (slotKey, cx, cy, subLabel, orientation = 'UP') => {
+    const label = getSwitchLabel(slotKey, switches);
+    const isThyristor = switches[slotKey] === 'T';
+    const isOn = activeSet.has(label) && hasCurrent;
+    const swCurrent = currentPoint.switchCurrents[label] || 0;
+    const strokeCol = isOn ? '#10B981' : '#64748B';
+    const boxFill = isOn ? 'rgba(16, 185, 129, 0.15)' : lightMode ? 'rgba(255,255,255,0.92)' : 'rgba(15,23,42,0.85)';
+    const boxStroke = isOn ? '#10B981' : lightMode ? '#CBD5E1' : '#334155';
+
+    return (
+      <g key={slotKey} className="cursor-pointer" onClick={() => onToggleSwitch(slotKey)}>
+        <rect x={cx - 34} y={cy - 42} width={68} height={84} rx={10} fill={boxFill} stroke={boxStroke} strokeWidth={isOn ? 2.2 : 1.2} />
+        <text x={cx - 24} y={cy - 24} fill={isOn ? '#10B981' : lightMode ? '#0F172A' : '#E2E8F0'} className="text-[12px] font-mono font-bold select-none">{label}</text>
+        <text x={cx} y={cy - 12} textAnchor="middle" fill="#64748B" className="text-[9px] font-mono select-none">{subLabel}</text>
+        {orientation === 'UP' ? (
+          <g>
+            <line x1={cx} y1={cy + 20} x2={cx} y2={cy - 8} stroke={strokeCol} strokeWidth={2} />
+            <polygon points={`${cx},${cy - 6} ${cx - 11},${cy + 12} ${cx + 11},${cy + 12}`} fill={isOn ? '#10B981' : 'none'} fillOpacity={isOn ? 0.35 : 0} stroke={strokeCol} strokeWidth={2} />
+            <line x1={cx - 12} y1={cy - 6} x2={cx + 12} y2={cy - 6} stroke={strokeCol} strokeWidth={2.2} />
+            {isThyristor && (
+              <g>
+                <polyline points={`${cx - 5},${cy - 6} ${cx - 14},${cy - 13} ${cx - 22},${cy - 13}`} fill="none" stroke={isOn ? '#10B981' : '#3B82F6'} strokeWidth={1.8} />
+                <text x={cx - 28} y={cy - 10} fill="#3B82F6" className="text-[9px] font-mono font-semibold select-none">G</text>
+              </g>
+            )}
+          </g>
+        ) : (
+          <g>
+            <line x1={cx - 18} y1={cy + 4} x2={cx + 18} y2={cy + 4} stroke={strokeCol} strokeWidth={2} />
+            <polygon points={`${cx + 10},${cy + 4} ${cx - 10},${cy - 7} ${cx - 10},${cy + 15}`} fill={isOn ? '#10B981' : 'none'} fillOpacity={isOn ? 0.35 : 0} stroke={strokeCol} strokeWidth={2} />
+            <line x1={cx + 10} y1={cy - 8} x2={cx + 10} y2={cy + 16} stroke={strokeCol} strokeWidth={2.2} />
+            {isThyristor && (
+              <g>
+                <polyline points={`${cx + 10},${cy - 2} ${cx + 18},${cy - 12} ${cx + 25},${cy - 12}`} fill="none" stroke={isOn ? '#10B981' : '#3B82F6'} strokeWidth={1.8} />
+                <text x={cx + 26} y={cy - 9} fill="#3B82F6" className="text-[9px] font-mono font-semibold select-none">G</text>
+              </g>
+            )}
+          </g>
+        )}
+        <text x={cx} y={cy + 33} textAnchor="middle" fill={isOn ? '#10B981' : '#64748B'} className="text-[10px] font-mono font-semibold select-none">
+          {isOn ? `ON (${swCurrent.toFixed(1)}A)` : 'OFF'}
+        </text>
+      </g>
+    );
+  };
+
+  const renderFreewheelingBranch = (x, topY, botY) => {
+    const midY = (topY + botY) / 2;
+    const isFWOn = activeSet.has('D_FW') && hasCurrent;
+    const strokeCol = isFWOn ? '#10B981' : freewheelingDiode ? '#64748B' : lightMode ? '#CBD5E1' : '#1E293B';
+    return (
+      <g className="cursor-pointer" onClick={onToggleFWD}>
+        <line x1={x} y1={topY} x2={x} y2={botY} stroke={isFWOn ? wireActive : strokeCol} strokeWidth={isFWOn ? 2.5 : 1.5} strokeDasharray={freewheelingDiode ? undefined : '5 5'} />
+        {isFWOn && <line x1={x} y1={botY} x2={x} y2={topY} stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" />}
+        <circle cx={x} cy={topY} r={3.5} fill={isFWOn ? wireActive : strokeCol} />
+        <circle cx={x} cy={botY} r={3.5} fill={isFWOn ? wireActive : strokeCol} />
+        <rect x={x - 28} y={midY - 30} width={56} height={60} rx={8} fill={isFWOn ? 'rgba(16,185,129,0.16)' : lightMode ? '#FFFFFF' : '#0F172A'} stroke={isFWOn ? '#10B981' : strokeCol} strokeWidth={isFWOn ? 2 : 1.2} strokeDasharray={freewheelingDiode ? undefined : '4 4'} />
+        <polygon points={`${x},${midY - 8} ${x - 10},${midY + 10} ${x + 10},${midY + 10}`} fill={isFWOn ? '#10B981' : 'none'} fillOpacity={isFWOn ? 0.35 : 0} stroke={strokeCol} strokeWidth={1.8} />
+        <line x1={x - 11} y1={midY - 8} x2={x + 11} y2={midY - 8} stroke={strokeCol} strokeWidth={2} />
+        <text x={x + 34} y={midY - 2} fill={isFWOn ? '#10B981' : '#64748B'} className="text-[10px] font-mono font-semibold select-none">D_FW</text>
+        <text x={x} y={midY + 24} textAnchor="middle" fill={isFWOn ? '#10B981' : '#64748B'} className="text-[9px] font-mono select-none">
+          {isFWOn ? `ON (${currentPoint.i_fw.toFixed(1)}A)` : freewheelingDiode ? 'READY' : 'OFF'}
+        </text>
+      </g>
+    );
+  };
+
+  const renderLoadStage = (x, topY, botY) => {
+    const midY = (topY + botY) / 2;
+    const isLoadActive = hasCurrent;
+    const loadStroke = isLoadActive ? wireActive : wireBase;
+    return (
+      <g>
+        <line x1={x} y1={topY} x2={x} y2={midY - 62} stroke={loadStroke} strokeWidth={isLoadActive ? 2.5 : 1.8} />
+        <line x1={x} y1={midY + 62} x2={x} y2={botY} stroke={loadStroke} strokeWidth={isLoadActive ? 2.5 : 1.8} />
+        {isLoadActive && (
+          <>
+            <line x1={x} y1={topY} x2={x} y2={midY - 62} stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" />
+            <line x1={x} y1={midY + 62} x2={x} y2={botY} stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" />
+          </>
+        )}
+        <text x={x + 14} y={topY + 4} fill="#EF4444" className="text-[11px] font-mono font-semibold select-none">+ Vo ({currentPoint.v_o.toFixed(1)} V)</text>
+        <text x={x + 14} y={botY + 4} fill="#3B82F6" className="text-[11px] font-mono font-semibold select-none">- Vo (GND)</text>
+        <rect x={x - 36} y={midY - 62} width={72} height={124} rx={10} fill={lightMode ? '#FFFFFF' : '#111827'} stroke={isLoadActive ? '#10B981' : lightMode ? '#CBD5E1' : '#334155'} strokeWidth={isLoadActive ? 2 : 1.5} />
+        <text x={x} y={midY - 44} textAnchor="middle" fill={isLoadActive ? '#10B981' : '#3B82F6'} className="text-[11px] font-mono font-semibold select-none">
+          {loadType === 'CURRENT_SOURCE' ? 'I_dc Load' : `${loadType} Load`}
+        </text>
+        {loadType === 'CURRENT_SOURCE' ? (
+          <text x={x} y={midY + 5} textAnchor="middle" fill="#F59E0B" className="text-[11px] font-mono font-bold select-none">I_dc = {I_dc_const}A</text>
+        ) : (
+          <g>
+            <text x={x} y={midY - 12} textAnchor="middle" fill={lightMode ? '#334155' : '#CBD5E1'} className="text-[10px] font-mono select-none">R = {R} Ω</text>
+            {(loadType === 'RL' || loadType === 'RLE') && (
+              <text x={x} y={midY + 14} textAnchor="middle" fill="#F59E0B" className="text-[10px] font-mono select-none">L = {L_mH} mH</text>
+            )}
+            {loadType === 'RLE' && (
+              <text x={x} y={midY + 40} textAnchor="middle" fill="#3B82F6" className="text-[10px] font-mono select-none">E = {E} V</text>
+            )}
+          </g>
+        )}
+        <rect x={x - 46} y={midY + 72} width={92} height={24} rx={6} fill={isLoadActive ? 'rgba(16, 185, 129, 0.14)' : 'rgba(100, 116, 139, 0.12)'} stroke={isLoadActive ? '#10B981' : '#64748B'} strokeWidth={1.2} />
+        <text x={x} y={midY + 88} textAnchor="middle" fill={isLoadActive ? '#10B981' : '#64748B'} className="text-[10.5px] font-mono font-semibold select-none">
+          i_o = +{currentPoint.i_o.toFixed(2)}A ▸
+        </text>
+      </g>
+    );
+  };
+
+  const renderCircuitCanvas = () => {
+    const topY = 95, botY = 355, midY = 225, loadX = 595;
+
+    if (phase === '1P' && wave === 'HALF') {
+      const l1 = getSwitchLabel('S1', switches);
+      const isS1On = activeSet.has(l1) && hasCurrent;
+      const isFWOn = activeSet.has('D_FW') && hasCurrent;
+      const fwX = 445;
+      return (
+        <svg viewBox="0 0 740 430" className="w-full h-full select-none">
+          <polyline points={`85,${midY - 28} 85,${topY} ${loadX},${topY}`} fill="none" stroke={wireBase} strokeWidth={1.8} />
+          <polyline points={`${loadX},${botY} 85,${botY} 85,${midY + 28}`} fill="none" stroke={wireBase} strokeWidth={1.8} />
+          {isS1On && (
+            <>
+              <polyline points={`85,${midY - 28} 85,${topY} ${fwX},${topY}`} fill="none" stroke={wireActive} strokeWidth={2.6} />
+              <polyline points={`85,${midY - 28} 85,${topY} ${fwX},${topY}`} fill="none" stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" />
+              <polyline points={`${fwX},${botY} 85,${botY} 85,${midY + 28}`} fill="none" stroke={wireActive} strokeWidth={2.6} />
+              <polyline points={`${fwX},${botY} 85,${botY} 85,${midY + 28}`} fill="none" stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" />
+            </>
+          )}
+          {(isS1On || isFWOn) && (
+            <>
+              <line x1={fwX} y1={topY} x2={loadX} y2={topY} stroke={wireActive} strokeWidth={2.6} />
+              <line x1={fwX} y1={topY} x2={loadX} y2={topY} stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" />
+              <line x1={loadX} y1={botY} x2={fwX} y2={botY} stroke={wireActive} strokeWidth={2.6} />
+              <line x1={loadX} y1={botY} x2={fwX} y2={botY} stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" />
+            </>
+          )}
+          <circle cx={85} cy={midY} r={28} fill={lightMode ? '#FFFFFF' : '#0F172A'} stroke={isS1On ? '#10B981' : '#3B82F6'} strokeWidth={2.2} />
+          <path d={`M 73 ${midY} Q 79 ${midY - 12} 85 ${midY} T 97 ${midY}`} fill="none" stroke={isS1On ? '#10B981' : '#3B82F6'} strokeWidth={2.2} />
+          <text x={85} y={midY + 48} textAnchor="middle" fill="#64748B" className="text-[10px] font-mono">vs = {currentPoint.v_sa.toFixed(1)}V</text>
+          {renderSwitch('S1', 274, topY - 4, 'Main Switch', 'RIGHT')}
+          {renderFreewheelingBranch(fwX, topY, botY)}
+          {renderLoadStage(loadX, topY, botY)}
+        </svg>
+      );
+    }
+
+    if (phase === '1P' && wave === 'FULL') {
+      const l1 = getSwitchLabel('S1', switches), l4 = getSwitchLabel('S4', switches), l3 = getSwitchLabel('S3', switches), l2 = getSwitchLabel('S2', switches);
+      const on1 = activeSet.has(l1) && hasCurrent, on2 = activeSet.has(l2) && hasCurrent, on3 = activeSet.has(l3) && hasCurrent, on4 = activeSet.has(l4) && hasCurrent, onFW = activeSet.has('D_FW') && hasCurrent;
+      const acLineActive = Math.abs(currentPoint.i_sa) > 0.01 && hasCurrent;
+      const acPositiveDir = currentPoint.i_sa > 0.01;
+      const legAX = 215, legBX = 335, fwX = 455, acTopY = 185, acBotY = 265;
+
+      return (
+        <svg viewBox="0 0 740 430" className="w-full h-full select-none">
+          <line x1={legAX} y1={topY} x2={loadX} y2={topY} stroke={wireBase} strokeWidth={1.8} />
+          <line x1={legAX} y1={botY} x2={loadX} y2={botY} stroke={wireBase} strokeWidth={1.8} />
+          <line x1={legAX} y1={topY} x2={legAX} y2={botY} stroke={wireBase} strokeWidth={1.8} />
+          <line x1={legBX} y1={topY} x2={legBX} y2={botY} stroke={wireBase} strokeWidth={1.8} />
+          <polyline points={`85,${midY - 27} 85,${acTopY} ${legAX},${acTopY}`} fill="none" stroke={wireBase} strokeWidth={1.8} />
+          <polyline points={`85,${midY + 27} 85,${acBotY} ${legBX},${acBotY}`} fill="none" stroke={wireBase} strokeWidth={1.8} />
+
+          {acLineActive && (
+            <>
+              <polyline points={acPositiveDir ? `85,${midY - 27} 85,${acTopY} ${legAX},${acTopY}` : `${legAX},${acTopY} 85,${acTopY} 85,${midY - 27}`} fill="none" stroke={wireActive} strokeWidth={2.6} />
+              <polyline points={acPositiveDir ? `85,${midY - 27} 85,${acTopY} ${legAX},${acTopY}` : `${legAX},${acTopY} 85,${acTopY} 85,${midY - 27}`} fill="none" stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" />
+              <polyline points={acPositiveDir ? `${legBX},${acBotY} 85,${acBotY} 85,${midY + 27}` : `85,${midY + 27} 85,${acBotY} ${legBX},${acBotY}`} fill="none" stroke={wireActive} strokeWidth={2.6} />
+              <polyline points={acPositiveDir ? `${legBX},${acBotY} 85,${acBotY} 85,${midY + 27}` : `85,${midY + 27} 85,${acBotY} ${legBX},${acBotY}`} fill="none" stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" />
+            </>
+          )}
+          {on1 && (<><line x1={legAX} y1={acTopY} x2={legAX} y2={topY} stroke={wireActive} strokeWidth={2.6} /><line x1={legAX} y1={acTopY} x2={legAX} y2={topY} stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" /></>)}
+          {on4 && (<><line x1={legAX} y1={botY} x2={legAX} y2={acTopY} stroke={wireActive} strokeWidth={2.6} /><line x1={legAX} y1={botY} x2={legAX} y2={acTopY} stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" /></>)}
+          {on3 && (<><line x1={legBX} y1={acBotY} x2={legBX} y2={topY} stroke={wireActive} strokeWidth={2.6} /><line x1={legBX} y1={acBotY} x2={legBX} y2={topY} stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" /></>)}
+          {on2 && (<><line x1={legBX} y1={botY} x2={legBX} y2={acBotY} stroke={wireActive} strokeWidth={2.6} /><line x1={legBX} y1={botY} x2={legBX} y2={acBotY} stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" /></>)}
+
+          {on1 && (<><line x1={legAX} y1={topY} x2={legBX} y2={topY} stroke={wireActive} strokeWidth={2.6} /><line x1={legAX} y1={topY} x2={legBX} y2={topY} stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" /></>)}
+          {(on1 || on3) && (<><line x1={legBX} y1={topY} x2={fwX} y2={topY} stroke={wireActive} strokeWidth={2.6} /><line x1={legBX} y1={topY} x2={fwX} y2={topY} stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" /></>)}
+          {(on1 || on3 || onFW) && (<><line x1={fwX} y1={topY} x2={loadX} y2={topY} stroke={wireActive} strokeWidth={2.6} /><line x1={fwX} y1={topY} x2={loadX} y2={topY} stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" /></>)}
+
+          {(on4 || on2 || onFW) && (<><line x1={loadX} y1={botY} x2={fwX} y2={botY} stroke={wireActive} strokeWidth={2.6} /><line x1={loadX} y1={botY} x2={fwX} y2={botY} stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" /></>)}
+          {(on4 || on2) && (<><line x1={fwX} y1={botY} x2={legBX} y2={botY} stroke={wireActive} strokeWidth={2.6} /><line x1={fwX} y1={botY} x2={legBX} y2={botY} stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" /></>)}
+          {on4 && (<><line x1={legBX} y1={botY} x2={legAX} y2={botY} stroke={wireActive} strokeWidth={2.6} /><line x1={legBX} y1={botY} x2={legAX} y2={botY} stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" /></>)}
+
+          <circle cx={85} cy={midY} r={27} fill={lightMode ? '#FFFFFF' : '#0F172A'} stroke={acLineActive ? '#10B981' : '#3B82F6'} strokeWidth={2.2} />
+          <path d={`M 73 ${midY} Q 79 ${midY - 11} 85 ${midY} T 97 ${midY}`} fill="none" stroke={acLineActive ? '#10B981' : '#3B82F6'} strokeWidth={2.2} />
+          <text x={85} y={midY + 48} textAnchor="middle" fill="#64748B" className="text-[10px] font-mono">vs = {currentPoint.v_sa.toFixed(1)}V</text>
+
+          {renderSwitch('S1', legAX, 138, 'Ph A (Top)', 'UP')}
+          {renderSwitch('S3', legBX, 138, 'Neut (Top)', 'UP')}
+          {renderSwitch('S4', legAX, 312, 'Ph A (Bot)', 'UP')}
+          {renderSwitch('S2', legBX, 312, 'Neut (Bot)', 'UP')}
+          {renderFreewheelingBranch(fwX, topY, botY)}
+          {renderLoadStage(loadX, topY, botY)}
+        </svg>
+      );
+    }
+
+    if (phase === '3P' && wave === 'HALF') {
+      const l1 = getSwitchLabel('S1', switches), l2 = getSwitchLabel('S2', switches), l3 = getSwitchLabel('S3', switches);
+      const on1 = activeSet.has(l1) && hasCurrent, on2 = activeSet.has(l2) && hasCurrent, on3 = activeSet.has(l3) && hasCurrent, onFW = activeSet.has('D_FW') && hasCurrent;
+      const leg1X = 200, leg2X = 295, leg3X = 390, fwX = 475, yA = 195, yB = 235, yC = 275;
+      const neutralReturnActive = on1 || on2 || on3;
+
+      return (
+        <svg viewBox="0 0 740 430" className="w-full h-full select-none">
+          <line x1={leg1X} y1={topY} x2={loadX} y2={topY} stroke={wireBase} strokeWidth={1.8} />
+          <polyline points={`${loadX},${botY} 45,${botY} 45,${yA}`} fill="none" stroke={wireBase} strokeWidth={1.8} />
+          <line x1={leg1X} y1={yA} x2={leg1X} y2={topY} stroke={wireBase} strokeWidth={1.8} />
+          <line x1={leg2X} y1={yB} x2={leg2X} y2={topY} stroke={wireBase} strokeWidth={1.8} />
+          <line x1={leg3X} y1={yC} x2={leg3X} y2={topY} stroke={wireBase} strokeWidth={1.8} />
+          <line x1={95} y1={yA} x2={leg1X} y2={yA} stroke={on1 ? wireActive : '#22C55E'} strokeOpacity={on1 ? 1 : 0.45} strokeWidth={on1 ? 2.6 : 1.6} />
+          <line x1={95} y1={yB} x2={leg2X} y2={yB} stroke={on2 ? wireActive : '#EF4444'} strokeOpacity={on2 ? 1 : 0.45} strokeWidth={on2 ? 2.6 : 1.6} />
+          <line x1={95} y1={yC} x2={leg3X} y2={yC} stroke={on3 ? wireActive : '#3B82F6'} strokeOpacity={on3 ? 1 : 0.45} strokeWidth={on3 ? 2.6 : 1.6} />
+
+          {on1 && (<><polyline points={`95,${yA} ${leg1X},${yA} ${leg1X},${topY}`} fill="none" stroke={wireActive} strokeWidth={2.6} /><polyline points={`95,${yA} ${leg1X},${yA} ${leg1X},${topY}`} fill="none" stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" /></>)}
+          {on2 && (<><polyline points={`95,${yB} ${leg2X},${yB} ${leg2X},${topY}`} fill="none" stroke={wireActive} strokeWidth={2.6} /><polyline points={`95,${yB} ${leg2X},${yB} ${leg2X},${topY}`} fill="none" stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" /></>)}
+          {on3 && (<><polyline points={`95,${yC} ${leg3X},${yC} ${leg3X},${topY}`} fill="none" stroke={wireActive} strokeWidth={2.6} /><polyline points={`95,${yC} ${leg3X},${yC} ${leg3X},${topY}`} fill="none" stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" /></>)}
+
+          {on1 && <line x1={leg1X} y1={topY} x2={leg2X} y2={topY} stroke={wireActive} strokeWidth={2.6} />}
+          {(on1 || on2) && <line x1={leg2X} y1={topY} x2={leg3X} y2={topY} stroke={wireActive} strokeWidth={2.6} />}
+          {(on1 || on2 || on3) && <line x1={leg3X} y1={topY} x2={fwX} y2={topY} stroke={wireActive} strokeWidth={2.6} />}
+          {(on1 || on2 || on3 || onFW) && (<><line x1={fwX} y1={topY} x2={loadX} y2={topY} stroke={wireActive} strokeWidth={2.6} /><line x1={loadX} y1={botY} x2={fwX} y2={botY} stroke={wireActive} strokeWidth={2.6} /></>)}
+          {neutralReturnActive && (<><polyline points={`${fwX},${botY} 45,${botY} 45,${on1 ? yA : on2 ? yB : yC} 60,${on1 ? yA : on2 ? yB : yC}`} fill="none" stroke={wireActive} strokeWidth={2.6} /><polyline points={`${fwX},${botY} 45,${botY} 45,${on1 ? yA : on2 ? yB : yC} 60,${on1 ? yA : on2 ? yB : yC}`} fill="none" stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" /></>)}
+
+          {renderSwitch('S1', leg1X, 138, 'Phase A', 'UP')}
+          {renderSwitch('S2', leg2X, 138, 'Phase B', 'UP')}
+          {renderSwitch('S3', leg3X, 138, 'Phase C', 'UP')}
+          {renderFreewheelingBranch(fwX, topY, botY)}
+          {renderLoadStage(loadX, topY, botY)}
+        </svg>
+      );
+    }
+
+    // 3P FULL-BRIDGE
+    const l1 = getSwitchLabel('S1', switches), l3 = getSwitchLabel('S3', switches), l5 = getSwitchLabel('S5', switches);
+    const l4 = getSwitchLabel('S4', switches), l6 = getSwitchLabel('S6', switches), l2 = getSwitchLabel('S2', switches);
+    const on1 = activeSet.has(l1) && hasCurrent, on3 = activeSet.has(l3) && hasCurrent, on5 = activeSet.has(l5) && hasCurrent;
+    const on4 = activeSet.has(l4) && hasCurrent, on6 = activeSet.has(l6) && hasCurrent, on2 = activeSet.has(l2) && hasCurrent, onFW = activeSet.has('D_FW') && hasCurrent;
+    const legAX = 195, legBX = 295, legCX = 395, fwX = 480, yA = 195, yB = 225, yC = 255;
+    const upY = on1 ? yA : on3 ? yB : on5 ? yC : null;
+    const lowY = on4 ? yA : on6 ? yB : on2 ? yC : null;
+
+    return (
+      <svg viewBox="0 0 740 430" className="w-full h-full select-none">
+        <line x1={legAX} y1={topY} x2={loadX} y2={topY} stroke={wireBase} strokeWidth={1.8} />
+        <line x1={legAX} y1={botY} x2={loadX} y2={botY} stroke={wireBase} strokeWidth={1.8} />
+        <line x1={legAX} y1={topY} x2={legAX} y2={botY} stroke={wireBase} strokeWidth={1.8} />
+        <line x1={legBX} y1={topY} x2={legBX} y2={botY} stroke={wireBase} strokeWidth={1.8} />
+        <line x1={legCX} y1={topY} x2={legCX} y2={botY} stroke={wireBase} strokeWidth={1.8} />
+        <line x1={52} y1={yA} x2={52} y2={yC} stroke={wireBase} strokeWidth={1.8} />
+        <line x1={95} y1={yA} x2={legAX} y2={yA} stroke={on1 || on4 ? wireActive : '#22C55E'} strokeOpacity={on1 || on4 ? 1 : 0.45} strokeWidth={on1 || on4 ? 2.6 : 1.6} />
+        <line x1={95} y1={yB} x2={legBX} y2={yB} stroke={on3 || on6 ? wireActive : '#EF4444'} strokeOpacity={on3 || on6 ? 1 : 0.45} strokeWidth={on3 || on6 ? 2.6 : 1.6} />
+        <line x1={95} y1={yC} x2={legCX} y2={yC} stroke={on5 || on2 ? wireActive : '#3B82F6'} strokeOpacity={on5 || on2 ? 1 : 0.45} strokeWidth={on5 || on2 ? 2.6 : 1.6} />
+
+        {upY !== null && lowY !== null && upY !== lowY && (
+          <><polyline points={`63,${lowY} 52,${lowY} 52,${upY} 63,${upY}`} fill="none" stroke={wireActive} strokeWidth={2.6} /><polyline points={`63,${lowY} 52,${lowY} 52,${upY} 63,${upY}`} fill="none" stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" /></>
+        )}
+        {on1 && (<><polyline points={`95,${yA} ${legAX},${yA} ${legAX},${topY}`} fill="none" stroke={wireActive} strokeWidth={2.6} /><polyline points={`95,${yA} ${legAX},${yA} ${legAX},${topY}`} fill="none" stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" /></>)}
+        {on3 && (<><polyline points={`95,${yB} ${legBX},${yB} ${legBX},${topY}`} fill="none" stroke={wireActive} strokeWidth={2.6} /><polyline points={`95,${yB} ${legBX},${yB} ${legBX},${topY}`} fill="none" stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" /></>)}
+        {on5 && (<><polyline points={`95,${yC} ${legCX},${yC} ${legCX},${topY}`} fill="none" stroke={wireActive} strokeWidth={2.6} /><polyline points={`95,${yC} ${legCX},${yC} ${legCX},${topY}`} fill="none" stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" /></>)}
+        {on4 && (<><polyline points={`${legAX},${botY} ${legAX},${yA} 95,${yA}`} fill="none" stroke={wireActive} strokeWidth={2.6} /><polyline points={`${legAX},${botY} ${legAX},${yA} 95,${yA}`} fill="none" stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" /></>)}
+        {on6 && (<><polyline points={`${legBX},${botY} ${legBX},${yB} 95,${yB}`} fill="none" stroke={wireActive} strokeWidth={2.6} /><polyline points={`${legBX},${botY} ${legBX},${yB} 95,${yB}`} fill="none" stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" /></>)}
+        {on2 && (<><polyline points={`${legCX},${botY} ${legCX},${yC} 95,${yC}`} fill="none" stroke={wireActive} strokeWidth={2.6} /><polyline points={`${legCX},${botY} ${legCX},${yC} 95,${yC}`} fill="none" stroke={wireParticle} strokeWidth={3} strokeDasharray="6 6" className="animate-current-flow" /></>)}
+
+        {on1 && <line x1={legAX} y1={topY} x2={legBX} y2={topY} stroke={wireActive} strokeWidth={2.6} />}
+        {(on1 || on3) && <line x1={legBX} y1={topY} x2={legCX} y2={topY} stroke={wireActive} strokeWidth={2.6} />}
+        {(on1 || on3 || on5) && <line x1={legCX} y1={topY} x2={fwX} y2={topY} stroke={wireActive} strokeWidth={2.6} />}
+        {(on1 || on3 || on5 || onFW) && <line x1={fwX} y1={topY} x2={loadX} y2={topY} stroke={wireActive} strokeWidth={2.6} />}
+
+        {(on4 || on6 || on2 || onFW) && <line x1={loadX} y1={botY} x2={fwX} y2={botY} stroke={wireActive} strokeWidth={2.6} />}
+        {(on4 || on6 || on2) && <line x1={fwX} y1={botY} x2={legCX} y2={botY} stroke={wireActive} strokeWidth={2.6} />}
+        {(on4 || on6) && <line x1={legCX} y1={botY} x2={legBX} y2={botY} stroke={wireActive} strokeWidth={2.6} />}
+        {on4 && <line x1={legBX} y1={botY} x2={legAX} y2={botY} stroke={wireActive} strokeWidth={2.6} />}
+
+        {renderSwitch('S1', legAX, 138, 'Ph A (Top)', 'UP')}
+        {renderSwitch('S3', legBX, 138, 'Ph B (Top)', 'UP')}
+        {renderSwitch('S5', legCX, 138, 'Ph C (Top)', 'UP')}
+        {renderSwitch('S4', legAX, 312, 'Ph A (Bot)', 'UP')}
+        {renderSwitch('S6', legBX, 312, 'Ph B (Bot)', 'UP')}
+        {renderSwitch('S2', legCX, 312, 'Ph C (Bot)', 'UP')}
+        {renderFreewheelingBranch(fwX, topY, botY)}
+        {renderLoadStage(loadX, topY, botY)}
+      </svg>
+    );
+  };
+
+  return (
+    <div className={`rounded-2xl border ${bgCard} flex flex-col justify-between overflow-hidden`}>
+      <div className={`px-6 py-4 border-b ${headerBorder} flex flex-wrap items-center justify-between gap-3`}>
+        <div>
+          <h2 className="text-base font-bold tracking-tight">Interactive Circuit Schematic</h2>
+          <p className="text-xs text-slate-500 mt-0.5">
+            Click any switch on the diagram to toggle <span className="text-blue-600 font-semibold">Diode (D)</span> ⇄ <span className="text-emerald-600 font-semibold">Thyristor (T)</span>, or click <span className="font-mono font-semibold">D_FW</span>.
+          </p>
+        </div>
+        <div className="text-right">
+          <div className="text-[10px] font-mono text-slate-500">ACTIVE CONDUCTION PATH</div>
+          <div className="text-xs font-mono font-semibold text-emerald-600">{currentPoint.activeLoopLabel}</div>
+        </div>
+      </div>
+      <div className={`relative flex-1 min-h-[430px] ${canvasBg} flex items-center justify-center p-4`}>
+        {renderCircuitCanvas()}
+      </div>
+    </div>
+  );
+}
+
+// =========================================================================
+// 3. WAVEFORM OSCILLOSCOPE COMPONENT
+// =========================================================================
+function WaveformOscilloscope({ params, result, currentDeg, onChangeDeg, lightMode }) {
+  const [activeTab, setActiveTab] = useState('SUPERIMPOSED');
+  const [numCycles, setNumCycles] = useState(1);
+  const [showVavg, setShowVavg] = useState(true);
+  const svgRef = useRef(null);
+  const [isDragging, setIsDragging] = useState(false);
+
+  const maxDeg = numCycles === 1 ? 360 : 720;
+  const visiblePoints = result.points.slice(0, maxDeg + 1);
+  const { metrics } = result;
+
+  const conductionBlocks = [];
+  for (let i = 0; i < visiblePoints.length; i++) {
+    const pt = visiblePoints[i];
+    const isOff = pt.activeSwitches.length === 0 || pt.i_o <= 0.01;
+    const lbl = isOff ? 'OFF' : pt.activeSwitches.join(' ');
+    if (conductionBlocks.length === 0 || conductionBlocks[conductionBlocks.length - 1].label !== lbl) {
+      conductionBlocks.push({ startDeg: pt.deg, endDeg: pt.deg + 1, label: lbl, isOff });
+    } else {
+      conductionBlocks[conductionBlocks.length - 1].endDeg = pt.deg + 1;
+    }
+  }
+
+  const padLeft = 46, padRight = 18, plotW = 680 - padLeft - padRight;
+  const degToX = (deg) => padLeft + (deg / maxDeg) * plotW;
+
+  const handlePointerEvent = (e) => {
+    if (!svgRef.current) return;
+    const rect = svgRef.current.getBoundingClientRect();
+    const relX = ((e.clientX - rect.left) / rect.width) * 680;
+    const clampedX = Math.max(padLeft, Math.min(padLeft + plotW, relX));
+    const deg = ((clampedX - padLeft) / plotW) * maxDeg;
+    onChangeDeg(Math.round(deg * 2) / 2);
+  };
+
+  const vMax = Math.ceil(((params.phase === '3P' ? metrics.V_m_LL : metrics.V_m) * 1.15) / 25) * 25;
+  const iPeak = Math.max(1, ...visiblePoints.map((p) => Math.max(Math.abs(p.i_o), Math.abs(p.i_sa))));
+  const iMax = Math.ceil(iPeak * 1.2);
+
+  const buildPath = (pts, getVal, yZero, yHalfSpan, maxVal) =>
+    pts.map((p, idx) => `${idx === 0 ? 'M' : 'L'} ${degToX(p.deg).toFixed(1)} ${(yZero - (getVal(p) / maxVal) * yHalfSpan).toFixed(1)}`).join(' ');
+
+  const bgCard = lightMode ? 'bg-white border-slate-200 text-slate-900 shadow-sm' : 'bg-[#111827] border-slate-800 text-slate-100';
+  const plotBg = lightMode ? '#F8FAFC' : '#0B0F19';
+  const gridCol = lightMode ? '#E2E8F0' : '#1E293B';
+  const headerBorder = lightMode ? 'border-slate-200' : 'border-slate-800';
+  const cursorDegInView = currentDeg % maxDeg;
+  const cursorX = degToX(cursorDegInView);
+  const activePt = visiblePoints[Math.min(visiblePoints.length - 1, Math.round(cursorDegInView))] || visiblePoints[0];
+
+  const renderSuperimposedPlot = () => {
+    const vTop = 18, vHeight = 164, vZero = vTop + vHeight / 2, vSpan = vHeight / 2 - 10;
+    const iTop = 204, iHeight = 132, iZero = iTop + iHeight / 2, iSpan = iHeight / 2 - 10;
+    const barTop = 352, barHeight = 24;
+
+    return (
+      <svg
+        ref={svgRef}
+        viewBox="0 0 680 388"
+        className="w-full h-full select-none cursor-crosshair touch-none"
+        onPointerDown={(e) => { setIsDragging(true); handlePointerEvent(e); }}
+        onPointerMove={(e) => { if (isDragging) handlePointerEvent(e); }}
+        onPointerUp={() => setIsDragging(false)}
+        onPointerLeave={() => setIsDragging(false)}
+      >
+        <rect x={padLeft} y={vTop} width={plotW} height={vHeight} rx={4} fill={plotBg} stroke={gridCol} />
+        <rect x={padLeft} y={iTop} width={plotW} height={iHeight} rx={4} fill={plotBg} stroke={gridCol} />
+        <line x1={padLeft} y1={vZero} x2={padLeft + plotW} y2={vZero} stroke={gridCol} />
+        <line x1={padLeft} y1={iZero} x2={padLeft + plotW} y2={iZero} stroke={gridCol} />
+        <text x={padLeft + 10} y={vTop + 15} fill="#64748B" className="text-[10.5px] font-semibold">Voltage Waveforms (v_s &amp; v_o)</text>
+        <text x={padLeft + 10} y={iTop + 15} fill="#64748B" className="text-[10.5px] font-semibold">Current Waveforms (i_o &amp; i_s)</text>
+
+        <path d={buildPath(visiblePoints, (p) => p.v_sa, vZero, vSpan, vMax)} fill="none" stroke="#38BDF8" strokeWidth={1.3} strokeDasharray="4 4" />
+        {showVavg && (
+          <line x1={padLeft} y1={vZero - (metrics.V_dc / vMax) * vSpan} x2={padLeft + plotW} y2={vZero - (metrics.V_dc / vMax) * vSpan} stroke="#A855F7" strokeWidth={1.4} strokeDasharray="5 4" />
+        )}
+        <path d={buildPath(visiblePoints, (p) => p.v_o, vZero, vSpan, vMax)} fill="none" stroke="#10B981" strokeWidth={2.4} />
+        <path d={buildPath(visiblePoints, (p) => p.i_sa, iZero, iSpan, iMax)} fill="none" stroke="#6366F1" strokeWidth={1.6} />
+        <path d={buildPath(visiblePoints, (p) => p.i_o, iZero, iSpan, iMax)} fill="none" stroke="#F59E0B" strokeWidth={2.3} />
+
+        {conductionBlocks.map((blk, i) => {
+          const x1 = degToX(blk.startDeg), x2 = degToX(Math.min(maxDeg, blk.endDeg)), w = Math.max(1, x2 - x1);
+          return (
+            <g key={i}>
+              <rect x={x1} y={barTop} width={w} height={barHeight} rx={2} fill={blk.isOff ? plotBg : 'rgba(16, 185, 129, 0.16)'} stroke={blk.isOff ? gridCol : '#10B981'} />
+              {w > 22 && <text x={x1 + w / 2} y={barTop + 15} textAnchor="middle" fill={blk.isOff ? '#64748B' : '#059669'} className="text-[9.5px] font-mono font-bold">{blk.label}</text>}
+            </g>
+          );
+        })}
+
+        <line x1={cursorX} y1={vTop} x2={cursorX} y2={barTop + barHeight} stroke="#2563EB" strokeWidth={1.5} strokeDasharray="3 3" />
+      </svg>
+    );
+  };
+
+  const renderFourChannelStack = () => {
+    const chHeight = 76, chGap = 14;
+    const channels = [
+      { title: 'Ch 1: AC Supply Voltage [V]', yTop: 10, maxVal: vMax, fn: (p) => p.v_sa, col: '#22C55E' },
+      { title: 'Ch 2: AC Line Current [A]', yTop: 10 + (chHeight + chGap), maxVal: iMax, fn: (p) => p.i_sa, col: '#3B82F6' },
+      { title: 'Ch 3: DC Output Voltage [V]', yTop: 10 + 2 * (chHeight + chGap), maxVal: vMax, fn: (p) => p.v_o, col: '#10B981' },
+      { title: 'Ch 4: DC Load Current [A]', yTop: 10 + 3 * (chHeight + chGap), maxVal: iMax, fn: (p) => p.i_o, col: '#F59E0B' },
+    ];
+    return (
+      <svg
+        ref={svgRef}
+        viewBox="0 0 680 388"
+        className="w-full h-full select-none cursor-crosshair touch-none"
+        onPointerDown={(e) => { setIsDragging(true); handlePointerEvent(e); }}
+        onPointerMove={(e) => { if (isDragging) handlePointerEvent(e); }}
+        onPointerUp={() => setIsDragging(false)}
+        onPointerLeave={() => setIsDragging(false)}
+      >
+        {channels.map((ch, idx) => {
+          const yZero = ch.yTop + chHeight / 2, ySpan = chHeight / 2 - 6;
+          return (
+            <g key={idx}>
+              <rect x={padLeft} y={ch.yTop} width={plotW} height={chHeight} rx={3} fill={plotBg} stroke={gridCol} />
+              <line x1={padLeft} y1={yZero} x2={padLeft + plotW} y2={yZero} stroke={gridCol} />
+              <text x={padLeft + 8} y={ch.yTop + 12} fill="#64748B" className="text-[9.5px] font-semibold">{ch.title}</text>
+              <path d={buildPath(visiblePoints, ch.fn, yZero, ySpan, ch.maxVal)} fill="none" stroke={ch.col} strokeWidth={2} />
+            </g>
+          );
+        })}
+        <line x1={cursorX} y1={10} x2={cursorX} y2={370} stroke="#2563EB" strokeWidth={1.5} strokeDasharray="3 3" />
+      </svg>
+    );
+  };
+
+  return (
+    <div className={`rounded-2xl border ${bgCard} flex flex-col justify-between overflow-hidden`}>
+      <div className={`px-6 py-4 border-b ${headerBorder} flex flex-wrap items-center justify-between gap-3`}>
+        <div className="flex items-center gap-1 p-1 rounded-xl border bg-slate-100 border-slate-200">
+          <button onClick={() => setActiveTab('SUPERIMPOSED')} className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold cursor-pointer ${activeTab === 'SUPERIMPOSED' ? 'bg-blue-600 text-white' : 'text-slate-600'}`}>Superimposed Waveforms</button>
+          <button onClick={() => setActiveTab('CHANNELS')} className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold cursor-pointer ${activeTab === 'CHANNELS' ? 'bg-blue-600 text-white' : 'text-slate-600'}`}>4-Channel Split</button>
+        </div>
+        <div className="flex items-center gap-2">
+          <button onClick={() => setNumCycles(numCycles === 1 ? 2 : 1)} className={`px-3 py-1.5 rounded-lg border ${headerBorder} text-xs font-mono cursor-pointer`}>{numCycles === 1 ? '1 Cycle (360°)' : '2 Cycles (720°)'}</button>
+          <button onClick={() => setShowVavg(!showVavg)} className="px-3 py-1.5 rounded-lg border border-purple-500/50 bg-purple-500/10 text-purple-600 text-xs font-mono font-semibold cursor-pointer">V_avg</button>
+        </div>
+      </div>
+      {activeTab === 'SUPERIMPOSED' && (
+        <div className="px-6 pt-3 flex flex-wrap gap-x-4 gap-y-1 text-[11px] font-mono font-semibold">
+          <span style={{ color: '#38BDF8' }}>┄ v_s</span>
+          <span style={{ color: '#10B981' }}>━ v_o</span>
+          <span style={{ color: '#A855F7' }}>┄ V_avg</span>
+          <span style={{ color: '#6366F1' }}>━ i_s</span>
+          <span style={{ color: '#F59E0B' }}>━ i_o</span>
+        </div>
+      )}
+      <div className="relative flex-1 min-h-[400px] p-2">
+        {activeTab === 'SUPERIMPOSED' ? renderSuperimposedPlot() : renderFourChannelStack()}
+      </div>
+      <div className={`px-6 py-3.5 border-t ${headerBorder} flex items-center gap-4 bg-slate-50`}>
+        <span className="text-xs font-mono font-medium text-slate-500 shrink-0">Scrub Phase Angle ωt:</span>
+        <input type="range" min={0} max={maxDeg} step={0.5} value={cursorDegInView} onChange={(e) => onChangeDeg(parseFloat(e.target.value))} className="w-full accent-blue-600 h-2 bg-slate-200 rounded-lg cursor-pointer" />
+        <div className="shrink-0 text-right font-mono text-xs font-bold text-blue-600 w-32">{cursorDegInView.toFixed(1)}° ({activePt.timeMs.toFixed(1)}ms)</div>
+      </div>
+    </div>
+  );
+}
+
+// =========================================================================
+// 4. MAIN APPLICATION WORKSPACE
+// =========================================================================
+function App() {
+  const [params, setParams] = useState({
+    phase: '1P', wave: 'FULL', devicePreset: 'THYRISTOR',
+    switches: { S1: 'T', S2: 'T', S3: 'T', S4: 'T', S5: 'T', S6: 'T' },
+    alphaDeg: 30, freewheelingDiode: false, loadType: 'RL', R: 15, L_mH: 50, E: 100, I_dc_const: 10, Ls_mH: 0, V_rms: 230, freq: 50,
+  });
+  const [currentDeg, setCurrentDeg] = useState(95.0);
+  const [isPlaying, setIsPlaying] = useState(true);
+  const [speed, setSpeed] = useState(0.2);
+  const [dark, setDark] = useState(() => {
+    try { const saved = localStorage.getItem('rectifier-theme'); if (saved) return saved === 'dark'; } catch (e) {}
+    return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  });
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', dark);
+    try { localStorage.setItem('rectifier-theme', dark ? 'dark' : 'light'); } catch (e) {}
+  }, [dark]);
+
+  const simulationResult = useMemo(() => runRectifierSimulation(params), [params]);
+  const { metrics } = simulationResult;
+
+  const lastFrameRef = useRef(null);
+  useEffect(() => {
+    if (!isPlaying) { lastFrameRef.current = null; return; }
+    let animId;
+    const step = (timestamp) => {
+      if (lastFrameRef.current !== null) {
+        const dtSec = (timestamp - lastFrameRef.current) / 1000;
+        setCurrentDeg((prev) => (prev + 180 * speed * dtSec) % 720);
+      }
+      lastFrameRef.current = timestamp;
+      animId = requestAnimationFrame(step);
+    };
+    animId = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(animId);
+  }, [isPlaying, speed]);
+
+  const updateParams = (patch) => setParams((prev) => ({ ...prev, ...patch }));
+  const toggleSwitch = (slotKey) => {
+    setParams((prev) => ({
+      ...prev,
+      devicePreset: 'CUSTOM',
+      switches: { ...prev.switches, [slotKey]: prev.switches[slotKey] === 'D' ? 'T' : 'D' },
+    }));
+  };
+
+  const applyPreset = (preset) => {
+    if (preset === 'DIODE') updateParams({ devicePreset: 'DIODE', switches: { S1: 'D', S2: 'D', S3: 'D', S4: 'D', S5: 'D', S6: 'D' } });
+    else if (preset === 'THYRISTOR') updateParams({ devicePreset: 'THYRISTOR', switches: { S1: 'T', S2: 'T', S3: 'T', S4: 'T', S5: 'T', S6: 'T' } });
+    else if (preset === 'SEMI') updateParams({ devicePreset: 'SEMI_SYMMETRIC', switches: { S1: 'T', S2: 'D', S3: 'T', S4: 'D', S5: 'T', S6: 'D' } });
+  };
+
+  const ptIdx = Math.min(simulationResult.points.length - 1, Math.max(0, Math.round(currentDeg)));
+  const currentPoint = simulationResult.points[ptIdx] || simulationResult.points[0];
+
+  return (
+    <main className="max-w-[1480px] mx-auto px-4 sm:px-8 py-6 space-y-6">
+      {/* Header with Name & Roll Number */}
+      <header className="rounded-2xl border bg-white border-slate-200 px-6 sm:px-8 py-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 shadow-sm">
+        <div className="space-y-1">
+          <h1 className="text-xl sm:text-2xl font-bold tracking-tight">Interactive AC-DC Converter &amp; Rectifier Simulator</h1>
+          <p className="text-sm text-slate-500">Real-time circuit schematic current flow and waveform oscilloscope for 1-Phase &amp; 3-Phase Diode and Thyristor rectifiers.</p>
+        </div>
+        <div className="flex items-center gap-3 shrink-0">
+          <button
+            onClick={() => setDark(!dark)}
+            aria-label="Toggle dark mode"
+            aria-pressed={dark}
+            className="px-4 py-2.5 rounded-xl border border-slate-200 bg-slate-50 text-xs font-semibold cursor-pointer"
+          >
+            {dark ? '☀ Light mode' : '☾ Dark mode'}
+          </button>
+        <div className="rounded-xl border bg-slate-50 border-slate-200 px-5 py-2.5 text-right shrink-0">
+          <div className="text-base font-bold tracking-tight">Arya Shah</div>
+          <div className="text-xs font-mono font-semibold text-blue-600 mt-0.5">Roll No: 24EE10038</div>
+        </div>
+        </div>
+      </header>
+
+      {/* Side-by-Side Interactive Schematic & Oscilloscope */}
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-6 items-stretch">
+        <CircuitSchematic
+          params={params}
+          currentPoint={currentPoint}
+          onToggleSwitch={toggleSwitch}
+          onToggleFWD={() => updateParams({ freewheelingDiode: !params.freewheelingDiode })}
+          lightMode={!dark}
+        />
+        <WaveformOscilloscope
+          params={params}
+          result={simulationResult}
+          currentDeg={currentDeg}
+          onChangeDeg={(deg) => { setIsPlaying(false); setCurrentDeg(deg); }}
+          lightMode={!dark}
+        />
+      </div>
+
+      {/* Live Telemetry Ribbon */}
+      <div className="rounded-2xl border bg-white border-slate-200 shadow-sm grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 divide-y sm:divide-y-0 sm:divide-x divide-slate-200 overflow-hidden">
+        <div className="p-4 sm:p-5">
+          <div className="text-xs text-slate-500 flex justify-between"><span>Avg DC Voltage</span><span className="font-mono font-semibold text-blue-600">V_dc</span></div>
+          <div className="mt-1.5 text-2xl font-mono font-bold">{metrics.V_dc.toFixed(1)} <span className="text-xs font-normal text-slate-400">V</span></div>
+          <div className="mt-1 text-xs font-mono text-slate-500">V_rms = {metrics.V_rms_out.toFixed(1)} V</div>
+          {params.Ls_mH > 0 && <div className="text-xs font-mono text-amber-600">With overlap: {metrics.V_dc_ov.toFixed(1)} V · μ = {metrics.muDeg.toFixed(1)}°</div>}
+        </div>
+        <div className="p-4 sm:p-5">
+          <div className="text-xs text-slate-500 flex justify-between"><span>Avg DC Current</span><span className="font-mono font-semibold text-emerald-600">I_dc</span></div>
+          <div className="mt-1.5 text-2xl font-mono font-bold text-emerald-600">{metrics.I_dc.toFixed(2)} <span className="text-xs font-normal text-slate-400">A</span></div>
+          <div className="mt-1 text-xs font-mono text-slate-500">I_rms = {metrics.I_rms_out.toFixed(2)} A</div>
+        </div>
+        <div className="p-4 sm:p-5">
+          <div className="text-xs text-slate-500 flex justify-between"><span>Load Power</span><span className="font-mono font-semibold text-amber-600">P_load</span></div>
+          <div className="mt-1.5 text-2xl font-mono font-bold text-amber-600">{metrics.P_load.toFixed(1)} <span className="text-xs font-normal text-slate-400">W</span></div>
+          <div className="mt-1 text-xs font-mono text-slate-500">S_in = {metrics.S_in.toFixed(0)} VA</div>
+        </div>
+        <div className="p-4 sm:p-5">
+          <div className="text-xs text-slate-500 flex justify-between"><span>True Power Factor</span><span className="font-mono font-semibold text-purple-600">TPF</span></div>
+          <div className="mt-1.5 text-2xl font-mono font-bold text-purple-600">{metrics.PF_true.toFixed(3)}</div>
+          <div className="mt-1 text-xs font-mono text-slate-500">cos(φ₁) = {metrics.DPF.toFixed(3)}</div>
+        </div>
+        <div className="p-4 sm:p-5">
+          <div className="text-xs text-slate-500 flex justify-between"><span>Ripple Factor</span><span className="font-mono font-semibold text-rose-600">RF</span></div>
+          <div className="mt-1.5 text-2xl font-mono font-bold text-rose-600">{metrics.RF.toFixed(3)}</div>
+          <div className="mt-1 text-xs font-mono text-slate-500">Form Factor = {metrics.FF.toFixed(2)}</div>
+        </div>
+        <div className="p-4 sm:p-5">
+          <div className="text-xs text-slate-500 flex justify-between"><span>Current THD_i</span><span className="font-mono font-semibold text-blue-600">THD</span></div>
+          <div className="mt-1.5 text-2xl font-mono font-bold text-blue-600">{metrics.THD_i.toFixed(1)}%</div>
+          <div className="mt-1 text-xs font-mono font-semibold text-emerald-600">{metrics.conductionMode} Mode</div>
+        </div>
+      </div>
+
+      {/* Interactive Controls Panel */}
+      <section className="rounded-2xl border bg-white border-slate-200 shadow-sm p-6 space-y-6">
+        <div className="flex flex-wrap items-center justify-between gap-4 pb-5 border-b border-slate-200">
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => setIsPlaying(!isPlaying)}
+              className={`py-2.5 px-5 rounded-xl font-semibold text-sm cursor-pointer ${isPlaying ? 'bg-amber-500 text-slate-950' : 'bg-blue-600 text-white'}`}
+            >
+              {isPlaying ? 'Pause Simulation' : 'Run Real-Time'}
+            </button>
+            <button onClick={() => { setIsPlaying(false); setCurrentDeg((p) => (p - 5 + 720) % 720); }} className="px-3.5 py-2.5 rounded-xl border border-slate-200 text-xs font-semibold cursor-pointer">-5°</button>
+            <button onClick={() => { setIsPlaying(false); setCurrentDeg((p) => (p + 5) % 720); }} className="px-3.5 py-2.5 rounded-xl border border-slate-200 text-xs font-semibold cursor-pointer">+5°</button>
+          </div>
+          <div className="flex items-center gap-2 bg-slate-50 border border-slate-200 px-4 py-2 rounded-xl">
+            <span className="text-xs font-medium text-slate-500 mr-1">Speed:</span>
+            {[0.1, 0.2, 0.5, 1, 2].map((s) => (
+              <button key={s} onClick={() => setSpeed(s)} className={`px-2.5 py-1 rounded-lg text-xs font-mono cursor-pointer ${Math.abs(speed - s) < 0.01 ? 'bg-blue-600 text-white font-semibold' : 'text-slate-600'}`}>{s}x</button>
+            ))}
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          {/* Column 1: Topology */}
+          <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-5 space-y-4">
+            <h3 className="text-sm font-bold">01. Converter Architecture</h3>
+            <div className="grid grid-cols-2 gap-1.5 p-1 rounded-xl bg-slate-200/70">
+              {['1P', '3P'].map((p) => (
+                <button key={p} onClick={() => updateParams({ phase: p })} className={`py-2 rounded-lg text-xs font-semibold cursor-pointer ${params.phase === p ? 'bg-slate-900 text-white' : 'text-slate-600'}`}>
+                  {p === '1P' ? 'Single-Phase (1Φ)' : 'Three-Phase (3Φ)'}
+                </button>
+              ))}
+            </div>
+            <div className="grid grid-cols-2 gap-1.5 p-1 rounded-xl bg-slate-200/70">
+              {['FULL', 'HALF'].map((w) => (
+                <button key={w} onClick={() => updateParams({ wave: w })} className={`py-2 rounded-lg text-xs font-semibold cursor-pointer ${params.wave === w ? 'bg-slate-900 text-white' : 'text-slate-600'}`}>
+                  {w === 'FULL' ? 'Full-Bridge' : 'Half-Wave'}
+                </button>
+              ))}
+            </div>
+            <div className="grid grid-cols-3 gap-2 pt-2">
+              <button onClick={() => applyPreset('DIODE')} className="py-2 rounded-xl border border-slate-200 bg-white text-xs font-semibold cursor-pointer">All Diodes</button>
+              <button onClick={() => applyPreset('THYRISTOR')} className="py-2 rounded-xl border border-slate-200 bg-white text-xs font-semibold cursor-pointer">All Thyristors</button>
+              <button onClick={() => applyPreset('SEMI')} disabled={params.wave === 'HALF'} className="py-2 rounded-xl border border-slate-200 bg-white text-xs font-semibold cursor-pointer disabled:opacity-40">Semi-Bridge</button>
+            </div>
+          </div>
+
+          {/* Column 2: Firing Angle & FWD */}
+          <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-5 space-y-4 flex flex-col justify-between">
+            <div className="space-y-3">
+              <div className="flex justify-between items-center">
+                <h3 className="text-sm font-bold">02. Firing Angle (α) &amp; D_FW</h3>
+                <span className="text-sm font-mono font-bold text-amber-600">α = {params.alphaDeg}°</span>
+              </div>
+              <input type="range" min={0} max={165} step={1} value={params.alphaDeg} onChange={(e) => updateParams({ alphaDeg: parseInt(e.target.value, 10) })} className="w-full accent-amber-500 h-2 bg-slate-200 rounded-lg cursor-pointer" />
+              <div className="grid grid-cols-6 gap-1.5">
+                {[0, 30, 45, 60, 90, 120].map((ang) => (
+                  <button key={ang} onClick={() => updateParams({ alphaDeg: ang })} className={`py-1 rounded-lg text-xs font-mono cursor-pointer ${params.alphaDeg === ang ? 'bg-amber-500 text-slate-950 font-bold' : 'bg-slate-200/70'}`}>{ang}°</button>
+                ))}
+              </div>
+            </div>
+            <div className="pt-3 border-t border-slate-200 space-y-3">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold">Freewheeling Diode (D_FW):</span>
+                <button onClick={() => updateParams({ freewheelingDiode: !params.freewheelingDiode })} className={`px-3.5 py-1.5 rounded-xl border text-xs font-mono font-semibold cursor-pointer ${params.freewheelingDiode ? 'border-emerald-500 bg-emerald-500/15 text-emerald-600' : 'border-slate-300 text-slate-600'}`}>
+                  {params.freewheelingDiode ? 'Connected' : 'Disconnected'}
+                </button>
+              </div>
+              <div className="space-y-1">
+                <div className="flex justify-between text-xs"><span className="text-slate-500">Source Inductance L_s (overlap, analytic):</span><span className="font-mono font-bold text-blue-600">{params.Ls_mH} mH</span></div>
+                <input type="range" min={0} max={25} step={1} value={params.Ls_mH} onChange={(e) => updateParams({ Ls_mH: parseInt(e.target.value, 10) })} className="w-full accent-blue-600 h-2 bg-slate-200 rounded-lg cursor-pointer" />
+              </div>
+            </div>
+          </div>
+
+          {/* Column 3: Load & Source */}
+          <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-5 space-y-4">
+            <h3 className="text-sm font-bold">03. Load &amp; Supply Values</h3>
+            <div className="grid grid-cols-4 gap-1 p-1 rounded-xl bg-slate-200/70">
+              {['R', 'RL', 'RLE', 'CURRENT_SOURCE'].map((lt) => (
+                <button key={lt} onClick={() => updateParams({ loadType: lt })} className={`py-1.5 rounded-lg text-xs font-semibold cursor-pointer ${params.loadType === lt ? 'bg-slate-900 text-white' : 'text-slate-600'}`}>
+                  {lt === 'CURRENT_SOURCE' ? 'Const I_dc' : lt}
+                </button>
+              ))}
+            </div>
+            <div className="space-y-2.5 pt-1">
+              {params.loadType === 'CURRENT_SOURCE' ? (
+                <div className="space-y-1">
+                  <div className="flex justify-between text-xs"><span className="text-slate-500">Constant Current (I_dc):</span><span className="font-mono font-bold text-emerald-600">{params.I_dc_const} A</span></div>
+                  <input type="range" min={1} max={40} step={1} value={params.I_dc_const} onChange={(e) => updateParams({ I_dc_const: parseInt(e.target.value, 10) })} className="w-full accent-emerald-500 h-2 bg-slate-200 rounded-lg cursor-pointer" />
+                </div>
+              ) : (
+                <>
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-xs"><span className="text-slate-500">Resistance (R):</span><span className="font-mono font-bold text-emerald-600">{params.R} Ω</span></div>
+                    <input type="range" min={1} max={100} step={1} value={params.R} onChange={(e) => updateParams({ R: parseInt(e.target.value, 10) })} className="w-full accent-emerald-500 h-2 bg-slate-200 rounded-lg cursor-pointer" />
+                  </div>
+                  {(params.loadType === 'RL' || params.loadType === 'RLE') && (
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-xs"><span className="text-slate-500">Inductance (L):</span><span className="font-mono font-bold text-amber-600">{params.L_mH} mH</span></div>
+                      <input type="range" min={1} max={300} step={1} value={params.L_mH} onChange={(e) => updateParams({ L_mH: parseInt(e.target.value, 10) })} className="w-full accent-amber-500 h-2 bg-slate-200 rounded-lg cursor-pointer" />
+                    </div>
+                  )}
+                  {params.loadType === 'RLE' && (
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-xs"><span className="text-slate-500">Back-EMF (E):</span><span className="font-mono font-bold text-blue-600">{params.E} V</span></div>
+                      <input type="range" min={0} max={300} step={5} value={params.E} onChange={(e) => updateParams({ E: parseInt(e.target.value, 10) })} className="w-full accent-blue-600 h-2 bg-slate-200 rounded-lg cursor-pointer" />
+                    </div>
+                  )}
+                </>
+              )}
+              <div className="space-y-1">
+                <div className="flex justify-between text-xs"><span className="text-slate-500">Source RMS (V_s):</span><span className="font-mono font-bold text-blue-600">{params.V_rms} V</span></div>
+                <input type="range" min={50} max={250} step={5} value={params.V_rms} onChange={(e) => updateParams({ V_rms: parseInt(e.target.value, 10) })} className="w-full accent-blue-600 h-2 bg-slate-200 rounded-lg cursor-pointer" />
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section className="rounded-2xl border bg-white border-slate-200 shadow-sm p-6 text-xs text-slate-500 space-y-1.5">
+        <h3 className="text-sm font-bold text-slate-900">Model assumptions</h3>
+        {metrics.fwdForced && <p className="text-amber-600 font-semibold">A constant-current load on a half-wave rectifier needs a freewheeling path, so D_FW is applied automatically.</p>}
+        <p>• Ideal switches and an ideal source; gate signals are treated as held on (no pulse-width effects).</p>
+        <p>• L_s is not added to the load inductance. Its effect is reported analytically: overlap angle μ and the voltage drop ΔV = n·a·ωL_sI/2π. Waveforms stay ideal (instant commutation), except single-phase with a constant-current load, which shows the overlap directly.</p>
+        <p>• Current THD excludes the DC component. The displacement factor is |cos φ₁| and does not show lead or lag.</p>
+      </section>
+    </main>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+  </script>
+</body>
+</html>
